@@ -1,0 +1,115 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse-server
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_pass}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./clk_data:/var/lib/clickhouse
+      - ./clk_log:/var/log/clickhouse
+      - ./data:/var/lib/clickhouse/user_files:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O /dev/null http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-bookworm
+    container_name: superset_cache
+    restart: unless-stopped
+    volumes:
+      - redis:/data
+
+  db:
+    image: postgres:16
+    container_name: superset_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: superset
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset_pass
+    volumes:
+      - db_home:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset -d superset"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  superset-init:
+    image: apache/superset:latest
+    container_name: superset_init
+    user: "root"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+    environment:
+      SUPERSET_SECRET_KEY: "super_secret_key_change_me_at_least_32_chars"
+      SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://superset:superset_pass@db:5432/superset"
+      SUPERSET_CONFIG_PATH: "/app/superset_home/superset_config.py"
+    volumes:
+      - superset_home:/app/superset_home
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat << 'EOF' > /app/superset_home/superset_config.py
+        import os
+        SQLALCHEMY_DATABASE_URI = os.getenv("SQLALCHEMY_DATABASE_URI")
+        SECRET_KEY = os.getenv("SUPERSET_SECRET_KEY")
+        EOF
+        (uv pip install psycopg2-binary clickhouse-connect || pip install psycopg2-binary clickhouse-connect)
+        superset db upgrade
+        superset fab create-admin --username admin --firstname Admin --lastname User --email admin@superset.com --password admin
+        superset init
+    healthcheck:
+      disable: true
+
+  superset:
+    image: apache/superset:latest
+    container_name: superset_app
+    user: "root"
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment:
+      SUPERSET_SECRET_KEY: "super_secret_key_change_me_at_least_32_chars"
+      SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://superset:superset_pass@db:5432/superset"
+      SUPERSET_CONFIG_PATH: "/app/superset_home/superset_config.py"
+    volumes:
+      - superset_home:/app/superset_home
+    command:
+      - /bin/sh
+      - -c
+      - |
+        (uv pip install psycopg2-binary clickhouse-connect || pip install psycopg2-binary clickhouse-connect)
+        /usr/bin/run-server.sh
+
+volumes:
+  superset_home:
+    external: false
+  db_home:
+    external: false
+  redis:
+    external: false

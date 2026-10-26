@@ -1,0 +1,8 @@
+# Данные ClickHouse
+*.csv
+clk_*
+
+#
+.*
+!.gitignore
+!.gitkeep

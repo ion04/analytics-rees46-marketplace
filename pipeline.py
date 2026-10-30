@@ -1,20 +1,21 @@
 """
 ClickHouse: таблицы -> загрузка CSV через file() -> синтетические каналы и расходы -> витрины.
 
-Команды (можно несколько подряд):
-    python pipeline/pipeline.py tables      # БД и таблицы
-    python pipeline/pipeline.py load        # CSV -> shop.events через file() на стороне сервера
-    python pipeline/pipeline.py channels    # shop.user_channels
-    python pipeline/pipeline.py spend       # shop.channel_spend
-    python pipeline/pipeline.py views       # представления для Superset
-    python pipeline/pipeline.py             # все шаги подряд
+Команды:
+    python pipeline.py tables      # БД и таблицы
+    python pipeline.py load        # CSV -> shop.events через file() на стороне сервера
+    python pipeline.py channels    # shop.user_channels
+    python pipeline.py spend       # shop.channel_spend
+    python pipeline.py cohorts     # shop.cohort_retention (когорты и retention)
+    python pipeline.py views       # представления для Superset
+    python pipeline.py             # все шаги подряд
 
 Требования для load: папка data/ смонтирована в контейнер как
     ./data:/var/lib/clickhouse/user_files:ro
 
 Настройки из .env: CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_HOST, CLICKHOUSE_PORT.
 
-СИНТЕТИКА (не факты из данных):
+СИНТЕТИКА:
     shop.user_channels : канал привлечения; acquisition_date = дата первого события
     shop.channel_spend : расходы и маржинальность по дням и каналам
 """
@@ -36,7 +37,7 @@ _client = None
 
 
 def get_client():
-    """Подключение создаётся при первом обращении (удобно для импорта из Airflow)."""
+    """Подключение создаётся при первом обращении."""
     global _client
     if _client is None:
         _client = clickhouse_connect.get_client(
@@ -80,6 +81,14 @@ DDL = [
         spend             Float64,
         gross_margin_rate Float64
     ) ENGINE = MergeTree() ORDER BY (channel, date)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shop.cohort_retention (
+        cohort       Date,
+        month_index  UInt8,
+        active_users UInt64,
+        buyers       UInt64
+    ) ENGINE = MergeTree() ORDER BY (cohort, month_index)
     """,
 ]
 
@@ -217,6 +226,41 @@ def build_channel_spend():
     print("channel_spend rows:", len(df))
 
 
+# 4a. Когорты и retention (реальные данные)
+# Когорта = месяц первого события; активен = >=1 событие в месяце; buyers = >=1 покупка.
+# Пользователи с > BOT_THRESHOLD событий исключены (см. п. 2.7 ноутбука).
+BOT_THRESHOLD = int(os.getenv("BOT_THRESHOLD", "1000"))
+
+COHORTS_SQL = """
+INSERT INTO shop.cohort_retention
+WITH cohorts AS (
+    SELECT user_id, toStartOfMonth(min(event_time)) AS cohort
+    FROM shop.events
+    GROUP BY user_id
+    HAVING count() <= {bot}
+)
+SELECT
+    c.cohort AS cohort,
+    toUInt8(dateDiff('month', c.cohort, toStartOfMonth(e.event_time))) AS month_index,
+    uniqExact(e.user_id) AS active_users,
+    uniqExactIf(e.user_id, e.event_type = 'purchase' AND e.price > 0) AS buyers
+FROM shop.events AS e
+INNER JOIN cohorts AS c USING (user_id)
+GROUP BY cohort, month_index
+SETTINGS max_bytes_before_external_group_by = 2000000000
+"""
+
+
+def build_cohorts():
+    client = get_client()
+    client.command("TRUNCATE TABLE shop.cohort_retention")
+    client.command(COHORTS_SQL.format(bot=BOT_THRESHOLD))
+    print(client.query_df(
+        "SELECT cohort, month_index, active_users, buyers "
+        "FROM shop.cohort_retention ORDER BY cohort, month_index"
+    ).to_string(index=False))
+
+
 #  5. Витрины
 VIEWS = [
     """
@@ -231,6 +275,24 @@ VIEWS = [
         SELECT acquisition_date AS date, channel, count() AS new_users
         FROM shop.user_channels GROUP BY date, channel
     ) AS u USING (date, channel)
+    """,
+    # Retention: доля когорты, активной / покупавшей в месяце k.
+    """
+    CREATE OR REPLACE VIEW shop.v_cohort_retention AS
+    SELECT
+        formatDateTime(r.cohort, '%Y-%m') AS cohort_month,
+        r.cohort AS cohort,
+        r.month_index AS month_index,
+        r.active_users AS active_users,
+        r.buyers AS buyers,
+        z.cohort_size AS cohort_size,
+        r.active_users / z.cohort_size AS retention,
+        r.buyers / z.cohort_size AS purchase_retention
+    FROM shop.cohort_retention AS r
+    INNER JOIN (
+        SELECT cohort, active_users AS cohort_size
+        FROM shop.cohort_retention WHERE month_index = 0
+    ) AS z USING (cohort)
     """,
     # Выручка - из реальных purchase; расходы и маржа - синтетические.
     """
@@ -279,6 +341,7 @@ STEPS = {
     "load": load_csv,
     "channels": build_user_channels,
     "spend": build_channel_spend,
+    "cohorts": build_cohorts,
     "views": build_views,
 }
 

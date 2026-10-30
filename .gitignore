@@ -1,8 +1,20 @@
-# Данные ClickHouse
+# Данные и хранилище ClickHouse
 *.csv
-clk_*
+data/*
+!data/.gitkeep
+clk_data/
+clk_log/
 
-#
+# Секреты
+.env
+
+# Python и Jupyter
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+
+# Остальные скрытые файлы не коммитим, кроме нужных
 .*
 !.gitignore
 !.gitkeep
+!.env.example

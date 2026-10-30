@@ -14,6 +14,7 @@ services:
       - ./clk_data:/var/lib/clickhouse
       - ./clk_log:/var/log/clickhouse
       - ./data:/var/lib/clickhouse/user_files:ro
+    mem_limit: 8g
     ulimits:
       nofile:
         soft: 262144
@@ -39,7 +40,7 @@ services:
     environment:
       POSTGRES_DB: superset
       POSTGRES_USER: superset
-      POSTGRES_PASSWORD: superset_pass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-superset_pass}
     volumes:
       - db_home:/var/lib/postgresql/data
     healthcheck:
@@ -60,9 +61,9 @@ services:
       clickhouse:
         condition: service_healthy
     environment:
-      SUPERSET_SECRET_KEY: "super_secret_key_change_me_at_least_32_chars"
-      SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://superset:superset_pass@db:5432/superset"
-      SUPERSET_CONFIG_PATH: "/app/superset_home/superset_config.py"
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-super_secret_key_change_me_at_least_32_chars}
+      SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:${POSTGRES_PASSWORD:-superset_pass}@db:5432/superset
+      SUPERSET_CONFIG_PATH: /app/superset_home/superset_config.py
     volumes:
       - superset_home:/app/superset_home
     command:
@@ -71,15 +72,14 @@ services:
       - |
         cat << 'EOF' > /app/superset_home/superset_config.py
         import os
+        ENABLE_PROXY_FIX = True
         SQLALCHEMY_DATABASE_URI = os.getenv("SQLALCHEMY_DATABASE_URI")
         SECRET_KEY = os.getenv("SUPERSET_SECRET_KEY")
         EOF
-        (uv pip install psycopg2-binary clickhouse-connect || pip install psycopg2-binary clickhouse-connect)
-        superset db upgrade
-        superset fab create-admin --username admin --firstname Admin --lastname User --email admin@superset.com --password admin
+        uv pip install --python /app/.venv/bin/python psycopg2-binary clickhouse-connect && \
+        superset db upgrade && \
+        (superset fab create-admin --username admin --firstname Admin --lastname User --email admin@superset.com --password ${SUPERSET_ADMIN_PASSWORD:-admin} || true) && \
         superset init
-    healthcheck:
-      disable: true
 
   superset:
     image: apache/superset:latest
@@ -94,22 +94,18 @@ services:
       clickhouse:
         condition: service_healthy
     environment:
-      SUPERSET_SECRET_KEY: "super_secret_key_change_me_at_least_32_chars"
-      SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://superset:superset_pass@db:5432/superset"
-      SUPERSET_CONFIG_PATH: "/app/superset_home/superset_config.py"
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-super_secret_key_change_me_at_least_32_chars}
+      SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:${POSTGRES_PASSWORD:-superset_pass}@db:5432/superset
+      SUPERSET_CONFIG_PATH: /app/superset_home/superset_config.py
     volumes:
       - superset_home:/app/superset_home
     command:
       - /bin/sh
       - -c
       - |
-        (uv pip install psycopg2-binary clickhouse-connect || pip install psycopg2-binary clickhouse-connect)
-        /usr/bin/run-server.sh
+        uv pip install --python /app/.venv/bin/python psycopg2-binary clickhouse-connect && /usr/bin/run-server.sh
 
 volumes:
   superset_home:
-    external: false
   db_home:
-    external: false
   redis:
-    external: false

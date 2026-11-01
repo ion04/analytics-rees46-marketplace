@@ -1,23 +1,15 @@
 """
-ClickHouse: таблицы -> загрузка CSV через file() -> синтетические каналы и расходы -> витрины.
+ClickHouse: Medallion Architecture Pipeline (Bronze -> Silver -> Gold).
 
 Команды:
-    python pipeline.py tables      # БД и таблицы
-    python pipeline.py load        # CSV -> shop.events через file() на стороне сервера
-    python pipeline.py channels    # shop.user_channels
-    python pipeline.py spend       # shop.channel_spend
-    python pipeline.py cohorts     # shop.cohort_retention (когорты и retention)
-    python pipeline.py views       # представления для Superset
-    python pipeline.py             # все шаги подряд
-
-Требования для load: папка data/ смонтирована в контейнер как
-    ./data:/var/lib/clickhouse/user_files:ro
-
-Настройки из .env: CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_HOST, CLICKHOUSE_PORT.
-
-СИНТЕТИКА:
-    shop.user_channels : канал привлечения; acquisition_date = дата первого события
-    shop.channel_spend : расходы и маржинальность по дням и каналам
+    python pipeline.py tables      # Создание БД и таблиц
+    python pipeline.py load        # CSV -> shop.events_raw (Bronze)
+    python pipeline.py silver      # Очистка, дедупликация, поиск ботов (Silver)
+    python pipeline.py channels    # Построение витрины каналов (Gold)
+    python pipeline.py spend       # Генерация синтетических расходов (Gold)
+    python pipeline.py cohorts     # Построение витрины когорт (Gold)
+    python pipeline.py views       # Создание View для Superset
+    python pipeline.py             # Запуск всего пайплайна 
 """
 import glob
 import os
@@ -35,7 +27,6 @@ SEED = int(os.getenv("SEED", "26"))
 
 _client = None
 
-
 def get_client():
     """Подключение создаётся при первом обращении."""
     global _client
@@ -45,16 +36,17 @@ def get_client():
             port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
             username=os.getenv("CLICKHOUSE_USER", "default"),
             password=os.getenv("CLICKHOUSE_PASSWORD", ""),
-            send_receive_timeout=3600,   # загрузка из file() идёт долго
+            send_receive_timeout=3600,
         )
     return _client
 
 
-# 1. DDL
-DDL = [
+# 1. DDL (Создание таблиц)
+# ==========================================
+BRONZE_DDL = [
     "CREATE DATABASE IF NOT EXISTS shop",
     """
-    CREATE TABLE IF NOT EXISTS shop.events (
+     CREATE TABLE IF NOT EXISTS shop.events_raw (
         event_time    DateTime('UTC'),
         event_type    LowCardinality(String),
         product_id    UInt64,
@@ -66,7 +58,43 @@ DDL = [
         user_session  Nullable(UUID)
     ) ENGINE = MergeTree()
     ORDER BY (event_type, user_id, event_time)
+    """
+]
+
+SILVER_DDL = [
+    """
+    CREATE TABLE IF NOT EXISTS shop.excluded_users (
+        user_id UInt64,
+        reason LowCardinality(String)
+    ) ENGINE = MergeTree() ORDER BY user_id
     """,
+    """
+    CREATE TABLE IF NOT EXISTS shop.products_dim (
+        product_id UInt64,
+        category_id UInt64,
+        category_code LowCardinality(String),
+        brand         LowCardinality(String)
+    ) ENGINE = ReplacingMergeTree()
+    ORDER BY product_id
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shop.events (
+        event_time    DateTime('UTC'),
+        event_type    LowCardinality(String),
+        product_id    UInt64,
+        category_id   UInt64,
+        category_code LowCardinality(String),
+        brand         LowCardinality(String),
+        price         Decimal64(2),
+        user_id       UInt64,
+        user_session  UUID
+    ) ENGINE = ReplacingMergeTree(event_time)
+    PARTITION BY toYYYYMM(event_time)
+    ORDER BY (event_type, user_id, event_time, product_id, user_session)
+    """
+]
+
+GOLD_DDL = [
     """
     CREATE TABLE IF NOT EXISTS shop.user_channels (
         user_id          UInt64,
@@ -89,26 +117,27 @@ DDL = [
         active_users UInt64,
         buyers       UInt64
     ) ENGINE = MergeTree() ORDER BY (cohort, month_index)
-    """,
+    """
 ]
 
-
 def create_tables():
-    for q in DDL:
-        get_client().command(q)
-    print("tables: ok")
+    client = get_client()
+    for q in BRONZE_DDL + SILVER_DDL + GOLD_DDL:
+        client.command(q)
+    print("tables: ok (Bronze, Silver, Gold)", flush=True)
 
-
-#  2. Загрузка CSV через file()
+# ==========================================
+# 2. Bronze Layer (Загрузка CSV)
+# ==========================================
 FILE_STRUCTURE = (
     "event_time String, event_type String, product_id UInt64, category_id UInt64, "
-    "category_code String, brand String, price Float64, user_id UInt64, user_session String"
+    "category_code Nullable(String), brand Nullable(String), price Float64, user_id UInt64, user_session String"
 )
 
 INSERT_FROM_FILE_SQL = """
-INSERT INTO shop.events
+INSERT INTO shop.events_raw
 SELECT
-    parseDateTimeBestEffort(event_time, 'UTC') AS event_time,
+    ifNull(parseDateTimeBestEffortOrNull(event_time, 'UTC'), toDateTime('1970-01-01', 'UTC')) AS event_time,
     event_type,
     product_id,
     category_id,
@@ -120,34 +149,101 @@ SELECT
 FROM file('{name}', 'CSVWithNames', '{structure}')
 """
 
-
 def load_csv():
-    # Имена берём из локальной папки data/, читает файлы сам ClickHouse
-    # из /var/lib/clickhouse/user_files (туда смонтирован ./data).
     client = get_client()
     names = sorted(os.path.basename(f) for f in glob.glob(DATA_GLOB))
     if not names:
         raise SystemExit(f"Нет файлов по маске {DATA_GLOB}")
-
-    client.command("TRUNCATE TABLE shop.events")
+    
+    client.command("TRUNCATE TABLE shop.events_raw")
     for name in names:
         print("loading", name, flush=True)
-        before = int(client.command("SELECT count() FROM shop.events"))
+        before = int(client.command("SELECT count() FROM shop.events_raw"))
         client.command(INSERT_FROM_FILE_SQL.format(name=name, structure=FILE_STRUCTURE))
-        after = int(client.command("SELECT count() FROM shop.events"))
+        after = int(client.command("SELECT count() FROM shop.events_raw"))
         print(f"  +{after - before:,} строк", flush=True)
 
-    print("events total:", f"{int(client.command('SELECT count() FROM shop.events')):,}")
-    print(client.query_df(
-        "SELECT event_type, count() AS rows, countIf(price <= 0) AS bad_price "
-        "FROM shop.events GROUP BY event_type ORDER BY rows DESC"
-    ).to_string(index=False))
+    print("events total:", f"{int(client.command('SELECT count() FROM shop.events_raw')):,}", flush=True)
 
 
-# 3. Каналы (синтетика)
-# Детерминированно (хэш user_id), неравномерно, с зависимостью от наличия покупки.
-# Сценарное допущение: платные каналы приводят больше "не покупателей",
-# органика и рефералы - больше покупателей.
+# 3. Silver Layer (Очистка и дедупликация)
+
+SILVER_LAYER_PIPELINE = {
+    'truncates' : [
+        "TRUNCATE TABLE shop.events",
+        "TRUNCATE TABLE shop.excluded_users",
+        "TRUNCATE TABLE shop.products_dim"
+    ],
+    'insertions' : [
+        # 1. Боты по частоте
+        """
+        INSERT INTO shop.excluded_users (user_id, reason)
+        SELECT DISTINCT user_id, 'high_daily_frequency' AS reason
+        FROM (
+            SELECT user_id, toDate(event_time) AS event_date, count() AS total_events
+            FROM shop.events_raw
+            GROUP BY user_id, event_date
+            HAVING total_events > 999
+        )
+        """,
+        # 2. Боты по скорости в сессии
+        """
+        INSERT INTO shop.excluded_users (user_id, reason)
+        SELECT DISTINCT 
+            user_id, 
+            'inhuman_session_speed' AS reason
+        FROM (
+            SELECT 
+                user_id,
+                dateDiff('second', min(event_time), max(event_time)) AS session_duration_sec,
+                count() AS events_in_session
+            FROM shop.events_raw
+            WHERE user_session IS NOT NULL
+            GROUP BY user_id, user_session 
+            HAVING events_in_session > 50 AND session_duration_sec < 60
+        )
+        """,
+        # 3. Справочник товаров (SCD Type 1)
+        """
+        INSERT INTO shop.products_dim
+        SELECT
+            product_id,
+            argMax(category_id, event_time) AS category_id,
+            argMax(ifNull(category_code, 'unknown'), event_time) AS category_code,
+            argMax(ifNull(brand, 'unknown'), event_time) AS brand
+        FROM shop.events_raw
+        GROUP BY product_id
+        """,
+        # 4. Основная таблица событий
+        """
+        INSERT INTO shop.events
+        SELECT
+            event_time,
+            event_type,
+            product_id,
+            category_id,
+            ifNull(category_code, 'unknown') AS category_code,
+            ifNull(brand, 'unknown') AS brand,
+            price,
+            user_id,
+            user_session
+        FROM shop.events_raw
+        WHERE user_session IS NOT NULL
+          AND (event_type != 'purchase' OR price > 0)
+        """
+    ]
+}
+
+def build_silver_layer():
+    client = get_client()
+    for stage_name, queries in SILVER_LAYER_PIPELINE.items():
+        print(f"--> Этап: {stage_name}...", flush=True)
+        for q in queries:
+            client.command(q)
+    print("Silver layer: завершен", flush=True)
+
+# 4. Gold Layer: Каналы
+
 USER_CHANNELS_SQL = """
 INSERT INTO shop.user_channels
 SELECT
@@ -166,35 +262,33 @@ FROM (
         toDate(min(event_time)) AS acquisition_date,
         countIf(event_type = 'purchase' AND price > 0) > 0 AS buyer,
         (cityHash64(user_id, 'channel_salt') % 10000) / 10000 AS r
-    FROM shop.events
+    FROM shop.events FINAL
+    LEFT ANTI JOIN shop.excluded_users USING (user_id) -- Исключаем ботов
     GROUP BY user_id
 )
 """
-
 
 def build_user_channels():
     client = get_client()
     client.command("TRUNCATE TABLE shop.user_channels")
     client.command(USER_CHANNELS_SQL)
+    print("user_channels: ok", flush=True)
     print(client.query_df(
         "SELECT channel, count() AS users FROM shop.user_channels "
         "GROUP BY channel ORDER BY users DESC"
-    ))
+    ).to_string(index=False))
 
 
-#  4. Расходы (синтетика)
+# 5. Gold Layer: Расходы
+
 CHANNEL_PARAMS = {
-    #                 budget_share, gross_margin_rate
     "paid_search":    (0.40, 0.22),
     "social":         (0.30, 0.20),
     "email":          (0.05, 0.28),
     "referral":       (0.10, 0.25),
     "organic_search": (0.15, 0.30),
-}  # доли бюджета в сумме = 1.0
-
-# Сценарное допущение: маркетинг ~ 8.75% выручки (~35% валовой маржи при марже ~25%)
+}
 MARKETING_SHARE_OF_REVENUE = 0.0875
-
 
 def build_channel_spend():
     client = get_client()
@@ -206,7 +300,8 @@ def build_channel_spend():
         freq="D",
     )
     revenue = float(client.command(
-        "SELECT sum(toFloat64(price)) FROM shop.events "
+        "SELECT sum(toFloat64(price)) FROM shop.events FINAL " 
+        "LEFT ANTI JOIN shop.excluded_users USING (user_id) "
         "WHERE event_type = 'purchase' AND price > 0"
     ))
     daily_budget = MARKETING_SHARE_OF_REVENUE * revenue / days.size
@@ -223,45 +318,41 @@ def build_channel_spend():
 
     client.command("TRUNCATE TABLE shop.channel_spend")
     client.insert_df("shop.channel_spend", df)
-    print("channel_spend rows:", len(df))
+    print("channel_spend rows:", len(df), flush=True)
 
 
-# 4a. Когорты и retention (реальные данные)
-# Когорта = месяц первого события; активен = >=1 событие в месяце; buyers = >=1 покупка.
-# Пользователи с > BOT_THRESHOLD событий исключены (см. п. 2.7 ноутбука).
-BOT_THRESHOLD = int(os.getenv("BOT_THRESHOLD", "1000"))
-
+# 6. Gold Layer: Когорты
 COHORTS_SQL = """
 INSERT INTO shop.cohort_retention
 WITH cohorts AS (
     SELECT user_id, toStartOfMonth(min(event_time)) AS cohort
-    FROM shop.events
+    FROM shop.events FINAL
+    LEFT ANTI JOIN shop.excluded_users USING (user_id)
     GROUP BY user_id
-    HAVING count() <= {bot}
 )
 SELECT
     c.cohort AS cohort,
     toUInt8(dateDiff('month', c.cohort, toStartOfMonth(e.event_time))) AS month_index,
     uniqExact(e.user_id) AS active_users,
     uniqExactIf(e.user_id, e.event_type = 'purchase' AND e.price > 0) AS buyers
-FROM shop.events AS e
+FROM shop.events AS e FINAL
 INNER JOIN cohorts AS c USING (user_id)
 GROUP BY cohort, month_index
 SETTINGS max_bytes_before_external_group_by = 2000000000
 """
 
-
 def build_cohorts():
     client = get_client()
     client.command("TRUNCATE TABLE shop.cohort_retention")
-    client.command(COHORTS_SQL.format(bot=BOT_THRESHOLD))
+    client.command(COHORTS_SQL)
+    print("cohorts: ok", flush=True)
     print(client.query_df(
         "SELECT cohort, month_index, active_users, buyers "
-        "FROM shop.cohort_retention ORDER BY cohort, month_index"
+        "FROM shop.cohort_retention ORDER BY cohort, month_index LIMIT 15"
     ).to_string(index=False))
 
 
-#  5. Витрины
+# 7. Gold Layer: View для Superset
 VIEWS = [
     """
     CREATE OR REPLACE VIEW shop.v_channel_daily AS
@@ -276,7 +367,6 @@ VIEWS = [
         FROM shop.user_channels GROUP BY date, channel
     ) AS u USING (date, channel)
     """,
-    # Retention: доля когорты, активной / покупавшей в месяце k.
     """
     CREATE OR REPLACE VIEW shop.v_cohort_retention AS
     SELECT
@@ -294,7 +384,6 @@ VIEWS = [
         FROM shop.cohort_retention WHERE month_index = 0
     ) AS z USING (cohort)
     """,
-    # Выручка - из реальных purchase; расходы и маржа - синтетические.
     """
     CREATE OR REPLACE VIEW shop.v_channel_unit_economics AS
     SELECT
@@ -317,7 +406,7 @@ VIEWS = [
         SELECT uc.channel AS channel,
                sum(toFloat64(e.price)) AS revenue,
                uniqExact(e.user_id) AS buyers
-        FROM shop.events AS e
+        FROM shop.events AS e FINAL 
         INNER JOIN shop.user_channels AS uc USING (user_id)
         WHERE e.event_type = 'purchase' AND e.price > 0
         GROUP BY channel
@@ -325,20 +414,21 @@ VIEWS = [
     """,
 ]
 
-
 def build_views():
     client = get_client()
     for q in VIEWS:
         client.command(q)
+    print("views: ok", flush=True)
     print(client.query_df(
         "SELECT * FROM shop.v_channel_unit_economics ORDER BY ltv_cac DESC"
-    ).to_string())
+    ).to_string(index=False))
 
 
 # CLI
 STEPS = {
     "tables": create_tables,
     "load": load_csv,
+    "silver": build_silver_layer, 
     "channels": build_user_channels,
     "spend": build_channel_spend,
     "cohorts": build_cohorts,
@@ -350,6 +440,7 @@ if __name__ == "__main__":
     unknown = [s for s in steps if s not in STEPS]
     if unknown:
         raise SystemExit(f"Неизвестные шаги: {unknown}. Доступны: {list(STEPS)}")
+    
     for s in steps:
-        print(f"--- {s}", flush=True)
+        print(f"\n--- Запуск: {s} ---", flush=True)
         STEPS[s]()
